@@ -9,24 +9,25 @@ use std::{
     time::Duration,
 };
 
+use arboard::Clipboard;
 use auto_launch::AutoLaunch;
-use clipboard::{ClipboardContext, ClipboardProvider};
 use emlx::parse_emlx;
-use enigo::{Enigo, Key, KeyboardControllable};
 use futures::{
     channel::mpsc::{channel, Receiver},
     SinkExt, StreamExt,
 };
 use home::home_dir;
 use log::{error, info, warn};
-use macos_accessibility_client::accessibility::application_is_trusted_with_prompt;
+use macos_accessibility_client::accessibility::{
+    application_is_trusted, application_is_trusted_with_prompt,
+};
 use mail_parser::MessageParser;
 use native_dialog::{MessageDialog, MessageType};
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
+use osakit::{Language, Script};
 use regex_lite::Regex;
 use rust_i18n::t;
 use serde::{Deserialize, Serialize};
-
 use tray_icon::{
     menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu},
     TrayIconBuilder,
@@ -61,6 +62,8 @@ pub struct MAConfig {
     pub listening_to_mail: bool,
     #[serde(default)]
     pub float_window: bool,
+    #[serde(default)]
+    pub recover_clipboard: bool,
 }
 
 fn default_flags() -> Vec<String> {
@@ -69,6 +72,7 @@ fn default_flags() -> Vec<String> {
         "动态密码".to_string(),
         "verification".to_string(),
         "code".to_string(),
+        "Code".to_string(),
         "인증".to_string(),
         "代码".to_string(),
     ]
@@ -84,20 +88,21 @@ impl Default for MAConfig {
             flags: default_flags(),
             listening_to_mail: false,
             float_window: false,
+            recover_clipboard: false,
         }
     }
 }
 
 impl MAConfig {
     // update the local config "~/.config/messauto/messauto.json"
-    pub fn update(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn update(&self) -> Result<(), Box<dyn Error>> {
         let updated_config_str = serde_json::to_string(&self)?;
-        std::fs::write(config_path(), updated_config_str)?;
+        fs::write(config_path(), updated_config_str)?;
         Ok(())
     }
 }
 
-pub fn config_path() -> std::path::PathBuf {
+pub fn config_path() -> PathBuf {
     let mut config_path = home_dir().unwrap();
     config_path.push(".config");
     config_path.push("messauto");
@@ -105,16 +110,13 @@ pub fn config_path() -> std::path::PathBuf {
     config_path
 }
 
-pub fn log_path() -> std::path::PathBuf {
-    // create a empty path buffer
+pub fn log_path() -> PathBuf {
     let mut log_path = home_dir().unwrap();
-    log_path.push(".local");
-    log_path.push("share");
+    log_path.push(".config");
     log_path.push("messauto");
-    log_path.push("logs");
     log_path.push("messauto.log");
     if !log_path.exists() {
-        std::fs::create_dir_all(log_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(log_path.parent().unwrap()).unwrap();
     }
     log_path
 }
@@ -123,10 +125,10 @@ pub fn read_config() -> MAConfig {
     if !config_path().exists() {
         let config = MAConfig::default();
         let config_str = serde_json::to_string(&config).unwrap();
-        std::fs::create_dir_all(config_path().parent().unwrap()).unwrap();
-        std::fs::write(config_path(), config_str).unwrap();
+        fs::create_dir_all(config_path().parent().unwrap()).unwrap();
+        fs::write(config_path(), config_str).unwrap();
     }
-    let config_str = std::fs::read_to_string(config_path()).unwrap();
+    let config_str = fs::read_to_string(config_path()).unwrap();
     let config: MAConfig = serde_json::from_str(&config_str).unwrap();
     config.update().unwrap();
     config
@@ -141,8 +143,10 @@ pub struct TrayMenuItems {
     pub check_launch_at_login: CheckMenuItem,
     pub add_flag: MenuItem,
     pub maconfig: MenuItem,
+    pub logs: MenuItem,
     pub listening_to_mail: CheckMenuItem,
     pub float_window: CheckMenuItem,
+    pub recover_clipboard: CheckMenuItem,
 }
 
 impl TrayMenuItems {
@@ -166,6 +170,8 @@ impl TrayMenuItems {
 
         let maconfig = MenuItem::new(t!("config"), true, None);
 
+        let logs = MenuItem::new(t!("logs"), true, None);
+
         let listening_to_mail = CheckMenuItem::new(
             t!("listening-to-mail"),
             true,
@@ -174,6 +180,13 @@ impl TrayMenuItems {
         );
 
         let float_window = CheckMenuItem::new(t!("float-window"), true, config.float_window, None);
+
+        let recover_clipboard = CheckMenuItem::new(
+            t!("recover-clipboard"),
+            true,
+            config.recover_clipboard,
+            None,
+        );
 
         TrayMenuItems {
             quit_i,
@@ -186,6 +199,8 @@ impl TrayMenuItems {
             listening_to_mail,
             float_window,
             maconfig,
+            logs,
+            recover_clipboard,
         }
     }
 }
@@ -198,6 +213,7 @@ impl TrayMenu {
         let _ = tray_menu.append_items(&[
             &tray_menu_items.check_auto_paste,
             &tray_menu_items.check_auto_return,
+            &tray_menu_items.recover_clipboard,
             &PredefinedMenuItem::separator(),
             &Submenu::with_items(
                 t!("hide-icon"),
@@ -215,6 +231,7 @@ impl TrayMenu {
             &tray_menu_items.float_window,
             &PredefinedMenuItem::separator(),
             &tray_menu_items.maconfig,
+            &tray_menu_items.logs,
             &PredefinedMenuItem::separator(),
             &tray_menu_items.quit_i,
         ]);
@@ -227,11 +244,11 @@ pub struct TrayIcon {}
 impl TrayIcon {
     pub fn build(tray_menu: Menu) -> Option<tray_icon::TrayIcon> {
         let bin_path = get_current_exe_path();
-        let mut icon_path = bin_path.join("Contents/Resources/images/icon.png");
+        let mut icon_path = bin_path.join("Contents/Resources/assets/images/icon.png");
         if !icon_path.exists() {
-            icon_path = "images/icon.png".into();
+            icon_path = "assets/images/icon.png".into();
         }
-        let icon = load_icon(std::path::Path::new(&icon_path));
+        let icon = load_icon(Path::new(&icon_path));
         Some(
             TrayIconBuilder::new()
                 .with_menu(Box::new(tray_menu))
@@ -243,7 +260,7 @@ impl TrayIcon {
     }
 }
 
-fn load_icon(path: &std::path::Path) -> tray_icon::Icon {
+fn load_icon(path: &Path) -> tray_icon::Icon {
     let (icon_rgba, icon_width, icon_height) = {
         let image = image::open(path)
             .expect("Failed to open icon path")
@@ -267,27 +284,60 @@ pub fn check_full_disk_access() {
     let check_db_path = home_dir()
         .expect("获取用户目录失败")
         .join("Library/Messages");
-    let ct = std::fs::read_dir(check_db_path);
+    let ct = fs::read_dir(check_db_path);
     if ct.is_err() {
-        warn!("访问受阻：没有完全磁盘访问权限");
+        warn!("{}", t!("access-blocked-no-full-disk-access"));
         let yes = MessageDialog::new()
             .set_type(MessageType::Info)
-            .set_title(t!("full-disk-access").as_str())
+            .set_title(t!("full-disk-access").to_string().as_str())
             .show_confirm()
             .unwrap();
         if yes {
-            Command::new("open")
-                .arg("/System/Library/PreferencePanes/Security.prefPane/")
-                .output()
-                .expect("Failed to open Disk Access Preferences window");
+            let output = Command::new("sh")
+                .arg("-c")
+                .arg(
+                    "open x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles",
+                )
+                .output();
+            if output.is_err() {
+                error!("{}", t!("error-when-open-authorization-window"));
+            } else {
+                warn!("{}", t!("popup-authorization-window"));
+            }
         }
-        warn!("已弹出窗口提醒用户授权，软件将关闭等待用户重启");
-        panic!("exit without full disk access");
+        // panic!("exit without full disk access");
+    } else {
+        info!("{}", t!("successfully-obtained-disk-access-permissions"));
+    }
+}
+
+pub fn check_script_permissions() -> bool {
+    let mut script = Script::new_from_source(
+        Language::AppleScript,
+        "
+        tell application \"System Events\"
+	key code 58
+        end tell
+    ",
+    );
+    script.compile().unwrap();
+    let result = script.execute();
+    if result.is_ok() {
+        return true;
+    } else {
+        return false;
     }
 }
 
 pub fn check_accessibility() -> bool {
-    application_is_trusted_with_prompt()
+    if application_is_trusted_with_prompt() && check_script_permissions() {
+        return true;
+    }
+    false
+}
+
+pub fn check_accessibility_with_no_action() -> bool {
+    application_is_trusted()
 }
 
 // 检查最新信息是否是验证码类型,并返回关键词来辅助定位验证码
@@ -302,7 +352,8 @@ pub fn check_captcha_or_other<'a>(stdout: &'a str, flags: &'a Vec<String>) -> bo
 
 // 利用正则表达式从信息中提取验证码
 pub fn get_captchas(stdout: &str) -> Vec<String> {
-    let re = Regex::new(r"\b[a-zA-Z0-9]{4,7}\b").unwrap(); // 只提取4-7位数字与字母组合
+    // let re = Regex::new(r"\b[a-zA-Z0-9]{4,8}\b").unwrap(); // 只提取4-8位数字与字母组合
+    let re = Regex::new(r"\b[a-zA-Z0-9][a-zA-Z0-9-]{2,6}[a-zA-Z0-9]\b").unwrap();
     let stdout_str = stdout;
     let mut captcha_vec = Vec::new();
     for m in re.find_iter(stdout_str) {
@@ -327,7 +378,7 @@ pub fn get_message_in_one_minute() -> String {
     String::from_utf8(output.stdout).unwrap()
 }
 
-// 如果信息中包含多个4-7位数字与字母组合（比如公司名称和验证码都是4-7位英文数字组合，例如CSDN）
+// 如果信息中包含多个4-8位数字与字母组合（比如公司名称和验证码都是4-8位英文数字组合，例如CSDN）
 // 则选取数字字符个数最多的的那个字串作为验证码
 pub fn get_real_captcha(stdout: &str) -> String {
     let captchas = get_captchas(stdout);
@@ -348,30 +399,38 @@ pub fn get_real_captcha(stdout: &str) -> String {
     real_captcha
 }
 
-// paste code
-pub fn paste(enigo: &mut Enigo) {
-    check_accessibility();
-    // Meta + v 粘贴
-    thread::sleep(Duration::from_millis(100));
-    enigo.key_down(Key::Meta);
-    thread::sleep(Duration::from_millis(100));
-    enigo.key_click(Key::Raw(0x09));
-    thread::sleep(Duration::from_millis(100));
-    enigo.key_up(Key::Meta);
-    thread::sleep(Duration::from_millis(100));
+pub fn paste_script() -> Result<(), Box<dyn Error>> {
+    let mut script = Script::new_from_source(
+        Language::AppleScript,
+        "
+        tell application \"System Events\"
+	keystroke \"v\" using command down
+        end tell
+    ",
+    );
+    script.compile()?;
+    script.execute()?;
+
+    Ok(())
 }
 
-// enter the pasted code
-pub fn enter(enigo: &mut Enigo) {
-    check_accessibility();
-    thread::sleep(Duration::from_millis(100));
-    enigo.key_click(Key::Return);
-    thread::sleep(Duration::from_millis(100));
+pub fn return_script() -> Result<(), Box<dyn Error>> {
+    let mut script = Script::new_from_source(
+        Language::AppleScript,
+        "
+        tell application \"System Events\"
+	key code 36
+        end tell
+    ",
+    );
+    script.compile()?;
+    script.execute()?;
+
+    Ok(())
 }
 
 pub fn messages_thread() {
-    std::thread::spawn(move || {
-        let mut enigo = Enigo::new();
+    thread::spawn(move || {
         let flags = read_config().flags;
         let check_db_path = home_dir().unwrap().join("Library/Messages/chat.db-wal");
         let mut last_metadata_modified = fs::metadata(&check_db_path).unwrap().modified().unwrap();
@@ -382,29 +441,43 @@ pub fn messages_thread() {
                 let stdout = get_message_in_one_minute();
                 let captcha_or_other = check_captcha_or_other(&stdout, &flags);
                 if captcha_or_other {
-                    // 保护用户隐私
-                    info!("检测到新的验证码类型信息：{:?}", stdout);
+                    info!("{}", t!("new-verification-code-detected"));
 
                     let captchas = get_captchas(&stdout);
-                    info!("所有可能的验证码为:{:?}", captchas);
+                    info!("{}:{:?}", t!("all-possible-codes"), captchas);
                     let real_captcha = get_real_captcha(&stdout);
-                    info!("提取到真正的验证码:{:?}", real_captcha);
-                    let mut ctx: ClipboardContext = ClipboardProvider::new().unwrap();
-                    ctx.set_contents(real_captcha.to_owned()).unwrap();
+                    info!("{}:{:?}", t!("real-verification-code"), real_captcha);
+                    let mut ctx = Clipboard::new().unwrap();
+                    let old_clipboard_contents = get_old_clipboard_contents();
+
                     let config = read_config();
                     if config.float_window {
                         let _child = open_app(real_captcha, t!("imessage").to_string());
-                    } else if config.auto_paste && !config.float_window {
-                        paste(&mut enigo);
-                        info!("粘贴验证码");
+                    } else if !config.float_window {
+                        ctx.set_text(&real_captcha).unwrap();
+                        if config.auto_paste {
+                            match paste_script() {
+                                Ok(_) => info!("{}", t!("paste-verification-code")),
+                                Err(e) => {
+                                    error!("{}: {:?}", t!("error-paste-verification-code"), e)
+                                }
+                            }
+                        }
                         if config.auto_return {
-                            enter(&mut enigo);
-                            info!("执行回车");
+                            match return_script() {
+                                Ok(_) => info!("{}", t!("press-enter")),
+                                Err(e) => error!("{}: {:?}", t!("error-press-enter"), e),
+                            }
+                        }
+                        if config.recover_clipboard {
+                            sleep(Duration::from_secs(2)); // wait applescript to finish
+                            recover_clipboard_contents(old_clipboard_contents);
                         }
                     }
                 }
+                sleep(Duration::from_secs(5));
             }
-            std::thread::sleep(Duration::from_secs(5));
+            sleep(Duration::from_secs(1)); // check db change every second
         }
     });
 }
@@ -453,8 +526,8 @@ pub fn check_for_updates() -> Result<bool, Box<dyn Error>> {
     // 转换为数字
     let latest_version = latest_version.parse::<i32>()?;
     let current_version = current_version.parse::<i32>()?;
-    info!("最新版本号: {}", latest_version);
-    info!("当前版本号: {}", current_version);
+    info!("{}: {}", t!("latest-version-number"), latest_version);
+    info!("{}: {}", t!("current-version-number"), current_version);
     // 如果最新版本号大于当前版本号,则提示更新
     if latest_version > current_version {
         return Ok(true);
@@ -485,7 +558,7 @@ pub fn download_latest_release() -> Result<(), Box<dyn Error>> {
                 "https://github.com/LeeeSe/MessAuto/releases/download/{}/MessAuto_x86_64.zip",
                 latest_version.unwrap()
             );
-            Command::new("curl")
+            let _ = Command::new("curl")
                 .arg(download_url)
                 .arg("--max-time")
                 .arg("10")
@@ -500,7 +573,7 @@ pub fn download_latest_release() -> Result<(), Box<dyn Error>> {
                 "https://github.com/LeeeSe/MessAuto/releases/download/{}/MessAuto_aarch64.zip",
                 latest_version.unwrap()
             );
-            Command::new("curl")
+            let _ = Command::new("curl")
                 .arg(download_url)
                 .arg("--max-time")
                 .arg("10")
@@ -511,31 +584,31 @@ pub fn download_latest_release() -> Result<(), Box<dyn Error>> {
                 .output()?;
         }
         _ => {
-            error!("不支持的平台");
+            error!("{}", t!("unsupported-platform"));
         }
     }
     if !Path::new("/tmp/MessAuto.zip").exists() {
-        warn!("新版本下载失败");
+        warn!("{}", t!("new-version-download-failed"));
         return Err("Download failed".into());
     } else {
-        info!("新版本下载成功");
+        info!("{}", t!("new-version-download-success"));
     }
     Ok(())
 }
 
 pub fn update_thread(tx: std::sync::mpsc::Sender<bool>) {
-    std::thread::spawn(move || {
+    thread::spawn(move || {
         if check_for_updates().is_ok() {
             if check_for_updates().unwrap() {
-                info!("检测到新版本");
+                info!("{}", t!("detected-new-version"));
                 if download_latest_release().is_ok() {
                     tx.send(true).unwrap();
                 }
             } else {
-                info!("当前已是最新版本");
+                info!("{}", t!("version-up-to-date"));
             }
         } else {
-            warn!("检查更新失败，请确保网络可以正常访问 Github 及其相关 API");
+            warn!("{}", t!("update-check-failed-ensure-network-access"));
         }
     });
 }
@@ -548,21 +621,21 @@ pub fn replace_old_version() -> Result<(), Box<dyn Error>> {
         .arg("-d")
         .arg("/tmp/")
         .output()?;
-    info!("解压: {:?}", unzip_output);
+    info!("{}: {:?}", t!("unzip-operation"), unzip_output);
 
-    Command::new("rm").arg("/tmp/MessAuto.zip").output()?;
+    let _ = Command::new("rm").arg("/tmp/MessAuto.zip").output()?;
 
     let mv_output = Command::new("cp")
         .arg("-R")
         .arg("/tmp/MessAuto.app")
         .arg(get_current_exe_path().parent().unwrap())
         .output()?;
-    info!("替换二进制文件: {:?}", mv_output);
+    info!("{}: {:?}", t!("replace-binary-file"), mv_output);
     Ok(())
 }
 
 pub fn mail_thread() {
-    std::thread::spawn(move || {
+    thread::spawn(move || {
         let mail_path = home_dir().unwrap().join("Library/Mail");
         let path = String::from(mail_path.to_str().unwrap());
 
@@ -603,43 +676,56 @@ async fn async_watch<P: AsRef<Path>>(path: P) -> notify::Result<()> {
                     for path in event.paths {
                         let path = path.to_string_lossy();
                         if path.contains(".emlx") && path.contains("INBOX.mbox") {
-                            info!("收到新邮件: {:?}", path);
+                            async_std::task::sleep(Duration::from_secs(1)).await; // prevent repeated reading
+                            info!("{}: {:?}", t!("new-email-received"), path);
                             let path = path.replace(".tmp", "");
                             let content = read_emlx(&path);
                             info!("len: {}", content.len());
 
-                            // 保护用户隐私
-                            info!("邮件内容：{:?}", content);
+                            // Protect user privacy
+                            // info!("{}", t!("email-content"));
 
                             if content.len() < 500 {
                                 let is_captcha =
                                     check_captcha_or_other(&content, &read_config().flags);
                                 if is_captcha {
-                                    // 保护用户隐私
-                                    // info!("检测到新的验证码类型邮件：{:?}", content);
-                                    info!("检测到新的验证码类型邮件");
+                                    info!("{}", t!("new-verification-email-detected"));
                                     let captchas = get_captchas(&content);
-                                    info!("所有可能的验证码为:{:?}", captchas);
+                                    info!("{}:{:?}", t!("all-possible-codes"), captchas);
                                     let real_captcha = get_real_captcha(&content);
-                                    info!("提取到真正的验证码:{:?}", real_captcha);
-                                    let mut ctx: ClipboardContext =
-                                        ClipboardProvider::new().unwrap();
-                                    ctx.set_contents(real_captcha.to_owned()).unwrap();
+                                    info!("{}:{:?}", t!("real-verification-code"), real_captcha);
+                                    let mut clpb = Clipboard::new().unwrap();
+
+                                    let old_clpb_contents = get_old_clipboard_contents();
+
                                     let config = read_config();
                                     if config.float_window {
                                         let _child = open_app(real_captcha, t!("mail").to_string());
                                     } else if config.auto_paste {
-                                        let mut enigo = Enigo::new();
-                                        paste(&mut enigo);
-                                        info!("粘贴验证码");
+                                        clpb.set_text(&real_captcha).unwrap();
+                                        match paste_script() {
+                                            Ok(_) => info!("{}", t!("paste-verification-code")),
+                                            Err(e) => error!(
+                                                "{}: {:?}",
+                                                t!("error-paste-verification-code"),
+                                                e
+                                            ),
+                                        }
                                         if config.auto_return {
-                                            enter(&mut enigo);
-                                            info!("执行回车");
+                                            match return_script() {
+                                                Ok(_) => info!("{}", t!("press-enter")),
+                                                Err(e) => {
+                                                    error!("{}: {:?}", t!("error-press-enter"), e)
+                                                }
+                                            }
+                                        }
+                                        if config.recover_clipboard {
+                                            async_std::task::sleep(Duration::from_secs(2)).await; //wait for pasted
+                                            recover_clipboard_contents(old_clpb_contents);
                                         }
                                     }
                                 }
                             }
-                            sleep(std::time::Duration::from_secs(5));
                         }
                     }
                 }
@@ -651,7 +737,7 @@ async fn async_watch<P: AsRef<Path>>(path: P) -> notify::Result<()> {
 }
 
 fn read_emlx(path: &str) -> String {
-    let mut file = std::fs::File::open(path).unwrap();
+    let mut file = fs::File::open(path).unwrap();
     let mut buffer = Vec::new();
 
     file.read_to_end(&mut buffer).unwrap();
@@ -676,4 +762,41 @@ fn start_process(command_args: Vec<String>) -> std::process::Child {
         .spawn()
         .unwrap();
     child
+}
+
+pub fn sleep_key() {
+    sleep(Duration::from_millis(60));
+}
+
+pub fn get_old_clipboard_contents() -> (
+    Result<String, arboard::Error>,
+    Result<arboard::ImageData<'static>, arboard::Error>,
+) {
+    let mut clpb = Clipboard::new().unwrap();
+    let string = clpb.get_text();
+    let image = clpb.get_image();
+
+    (string, image)
+}
+
+pub fn recover_clipboard_contents(
+    contents: (
+        Result<String, arboard::Error>,
+        Result<arboard::ImageData<'_>, arboard::Error>,
+    ),
+) {
+    let mut clpb = Clipboard::new().unwrap();
+    if contents.0.is_ok() {
+        let _ = clpb.set_text(contents.0.as_ref().unwrap());
+        info!(
+            "{}:{:?}",
+            t!("old-clpb-contents"),
+            contents.0.as_ref().unwrap()
+        );
+    } else if contents.1.is_ok() {
+        let _ = clpb.set_image(contents.1.unwrap());
+        info!("{}:{:?}", t!("old-clpb-contents"), "is an image");
+    } else {
+        warn!("{}", t!("unable-to-recover-clipboard"));
+    }
 }

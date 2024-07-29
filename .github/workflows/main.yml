@@ -21,7 +21,7 @@ jobs:
           override: true
 
     - name: Install dependencies
-      run: cargo install cargo-bundle
+      run: cargo install cargo-bundle --git https://github.com/zed-industries/cargo-bundle.git --branch add-plist-extension
 
     - name: Add aarch64 target
       run: rustup target add aarch64-apple-darwin
